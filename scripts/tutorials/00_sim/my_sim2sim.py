@@ -24,7 +24,7 @@ except ImportError:
     pass
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Sim2Sim UR5e (Action Dim Fix)")
+parser = argparse.ArgumentParser(description="Sim2Sim UR5e (Final Obs Structure)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.livestream = 1 
@@ -115,7 +115,6 @@ class UR5eSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class ActionsCfg:
-    # command_type="pose" 需要 7 维输入 (3 Pos + 4 Quat)
     arm_action = mdp.DifferentialInverseKinematicsActionCfg(
         asset_name="robot", joint_names=["shoulder_.*", "elbow_.*", "wrist_.*"], body_name="tool0",
         controller=DifferentialIKControllerCfg(command_type="pose", ik_method="dls"), scale=0.5,
@@ -125,6 +124,7 @@ class ActionsCfg:
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
+        # 只要能生成数据通过初始化检查就行
         dummy_joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel)
     policy = PolicyCfg()
 
@@ -156,7 +156,7 @@ class Sim2SimAdapter:
         self.device = env.device
         
         print(f"📥 Loading Weights: {weight_path}")
-        self.obs_dim = 63
+        self.obs_dim = 63  # 严格匹配 Total Dim
         self.action_dim = 4
         
         self.policy = SB3CompatibleActor(self.obs_dim, self.action_dim).to(self.device)
@@ -166,26 +166,15 @@ class Sim2SimAdapter:
             self.policy.load_state_dict(state_dict, strict=True)
             print("✅ Policy weights loaded perfectly!")
         except Exception as e:
-            print(f"❌ Strict loading failed, trying non-strict: {e}")
+            print(f"❌ Strict loading failed: {e}")
             self.policy.load_state_dict(state_dict, strict=False)
 
         self.policy.eval()
 
         try:
             stats = torch.load(stats_path, map_location=self.device)
-            mean_from_file = stats["mean"].to(self.device)
-            var_from_file = stats["var"].to(self.device)
-            
-            if mean_from_file.shape[0] != self.obs_dim:
-                print(f"⚠️ Norm stats dim mismatch. Padding with zeros.")
-                self.obs_mean = torch.zeros(self.obs_dim, device=self.device)
-                self.obs_var = torch.ones(self.obs_dim, device=self.device)
-                min_dim = min(mean_from_file.shape[0], self.obs_dim)
-                self.obs_mean[:min_dim] = mean_from_file[:min_dim]
-                self.obs_var[:min_dim] = var_from_file[:min_dim]
-            else:
-                self.obs_mean = mean_from_file
-                self.obs_var = var_from_file
+            self.obs_mean = stats["mean"].to(self.device)
+            self.obs_var = stats["var"].to(self.device)
             print("✅ Norm stats loaded.")
         except:
             print("⚠️ Using default stats.")
@@ -212,42 +201,55 @@ class Sim2SimAdapter:
         cube_pos = cube.data.root_pos_w
         cube_quat = cube.data.root_quat_w
         
-        gripper_fake = torch.zeros((arm_q.shape[0], 6), device=self.device)
-        
-        base_obs = torch.cat([
-            torch.cos(arm_q), torch.sin(arm_q), 
-            arm_dq, 
-            eef_pos, 
-            torch.cat([eef_quat[:, 1:], eef_quat[:, 0:1]], dim=-1), 
-            gripper_fake, gripper_fake, 
+        # --- 1. 构建 Object State (10 dims) ---
+        # 顺序: [cube_pos(3), cube_quat(4), relative_pos(3)]
+        # ⚠️ 注意：Robosuite 的 relative 是 (cube - gripper) 还是 (gripper - cube)？
+        # 通常是 object - gripper (目标 - 当前)
+        obj_state = torch.cat([
             cube_pos, 
-            torch.cat([cube_quat[:, 1:], cube_quat[:, 0:1]], dim=-1), 
-            cube_pos - eef_pos 
+            cube_quat, 
+            cube_pos - eef_pos
+        ], dim=-1) # (N, 10)
+
+        # --- 2. 构建 Proprio State (53 dims) ---
+        # 核心数据: [cos(6), sin(6), vel(6), eef_pos(3), eef_quat(4)] = 25 dims
+        # 剩余 28 dims: 我们用 0 填充 (包含 joint_pos, acc, gripper等)
+        # ⚠️ 注意: inspect_obs 显示 raw dict 里还有 joint_pos(6)，为了保险，我们把它也加上
+        
+        proprio_core = torch.cat([
+            torch.cos(arm_q),   # (N, 6)
+            torch.sin(arm_q),   # (N, 6)
+            arm_dq,             # (N, 6)
+            eef_pos,            # (N, 3)
+            eef_quat,           # (N, 4)
+            # 这里是 25 维
         ], dim=-1)
+        
+        # 目标是 53 维，还需要补 28 维
+        # 我们用 arm_q (6) + zeros(22) 来填充，因为 raw dict 里有 joint_pos
+        padding = torch.cat([
+            arm_q, # (N, 6)
+            torch.zeros((arm_q.shape[0], 22), device=self.device) # (N, 22)
+        ], dim=-1)
+        
+        proprio_state = torch.cat([proprio_core, padding], dim=-1) # (N, 53)
 
-        padding_size = self.obs_dim - base_obs.shape[-1]
-        if padding_size > 0:
-            padding = torch.zeros((base_obs.shape[0], padding_size), device=self.device)
-            obs = torch.cat([base_obs, padding], dim=-1)
-        else:
-            obs = base_obs
+        # --- 3. 最终拼接 (必须 Object 在前!) ---
+        obs = torch.cat([obj_state, proprio_state], dim=-1) # (N, 63)
 
+        # 归一化
         norm_obs = torch.clamp((obs - self.obs_mean) / torch.sqrt(self.obs_var + 1e-8), -10, 10)
         
+        # 推理
         with torch.no_grad():
             action = self.policy(norm_obs)
             
-        # ⚠️ 关键修正：DiffIK Pose 模式需要 7 维动作 (Pos + Rot)
-        # 模型输出 action shape: (N, 4) -> [x, y, z, grip?]
-        # 我们只取前3维位置
+        # 动作转换: 4D (Pos+Grip) -> 7D (Pos+Rot+Grip)
         target_pos = action[:, :3]
-        
-        # 构造 4D 单位四元数 [1, 0, 0, 0] (w, x, y, z) 代表不旋转
-        # shape: (N, 4)
+        # 构造单位四元数 [1, 0, 0, 0]
         target_rot = torch.zeros((action.shape[0], 4), device=self.device)
-        target_rot[:, 0] = 1.0 # 设置 w = 1.0
+        target_rot[:, 0] = 1.0 
         
-        # 3 (Pos) + 4 (Quat) = 7
         target_action = torch.cat([target_pos, target_rot], dim=-1)
             
         return target_action
@@ -267,7 +269,7 @@ def main():
     env = ManagerBasedRLEnv(cfg=UR5eLiftEnvCfg())
     adapter = Sim2SimAdapter(env, weight_path, stats_path)
     env.reset()
-    print("🚀 Sim2Sim Running (Dimensions 7D Corrected!)...")
+    print("🚀 Sim2Sim Running (Obs Order Corrected!)...")
     
     while simulation_app.is_running():
         env.step(adapter.step())
