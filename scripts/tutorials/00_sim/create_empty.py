@@ -25,6 +25,9 @@ parser = argparse.ArgumentParser(description="Tutorial on creating an empty stag
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+# 强制禁用 Fabric，强制单显卡，强制绑定全网段IP
+args_cli.kit_args = "--no-ext omni.physx.fabric --/renderer/multiGpu/enabled=False --/renderer/activeGpu=0 --/app/livestream/allow_remote_access=true"
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -38,7 +41,7 @@ def main():
     """Main function."""
 
     # Initialize the simulation context
-    sim_cfg = SimulationCfg(dt=0.01)
+    sim_cfg = SimulationCfg(dt=0.01, use_fabric=False)
     sim = SimulationContext(sim_cfg)
     # Set main camera
     sim.set_camera_view([2.5, 2.5, 2.5], [0.0, 0.0, 0.0])
